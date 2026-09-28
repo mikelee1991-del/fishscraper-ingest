@@ -1,0 +1,200 @@
+name: Cadastre AIS extract
+
+# Public Actions minutes. Fleet-filtered Marine Cadastre extract for private
+# FishScraper. Live aisstream websocket collect stays in
+# mikelee1991-del/aisstream-collector (Release aisstream-live). This job does
+# not merge those shards, rebuild the map, or deploy Cloudflare.
+#
+# Daily chunk (same planner as FishScraper watch): up to 800 days, 6 workers,
+# --replace-aisstream. Catch-up stays in the Actions cache until the tree has
+# at least 3500 ais_YYYY-MM-DD.parquet files. Only then do we pack and upload
+# Release tag ais-daily-archive / asset ais_daily.tar.zst.
+#
+# Cron 15:00 UTC is before private ais-watch at 15:30 UTC.
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      max_extract_days:
+        description: "Max Cadastre days to extract this run (catch-up chunk)"
+        required: false
+        default: "800"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: cadastre-extract
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ais-daily-archive
+  ARCHIVE_NAME: ais_daily.tar.zst
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Probe Marine Cadastre availability
+        id: cadastre
+        run: |
+          python3 scripts/check_ais_cadastre.py \
+            --out docs/data/ais_cadastre_status.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Restore ais_daily cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data/processed/ais_daily
+          key: ais-daily-v2-${{ github.run_id }}
+          restore-keys: |
+            ais-daily-v2-
+
+      - name: Download ais_daily Release archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/processed
+          # Union with cache: unpack never deletes extra days already on disk.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release download "$RELEASE_TAG" -p "$ARCHIVE_NAME" -D data/processed || true
+            if [ -f "data/processed/$ARCHIVE_NAME" ]; then
+              python3 scripts/ais_daily_archive.py unpack \
+                --archive "data/processed/$ARCHIVE_NAME" \
+                --dest data/processed
+            else
+              echo "Release exists but asset missing — catch-up stays in cache."
+            fi
+          else
+            echo "No $RELEASE_TAG release yet — catch-up stays in cache until 3500 days."
+          fi
+
+      - name: Plan extract window
+        id: plan
+        env:
+          MAX_DAYS: ${{ github.event.inputs.max_extract_days || '800' }}
+        run: |
+          set -euo pipefail
+          LATEST="${{ steps.cadastre.outputs.latest_published_day }}"
+          if [ -z "$LATEST" ]; then
+            echo "need_extract=false" >> "$GITHUB_OUTPUT"
+            echo "No Cadastre latest day — skipping extract."
+            exit 0
+          fi
+          python3 scripts/ais_daily_archive.py plan \
+            --ais-dir data/processed/ais_daily \
+            --target-end "$LATEST" \
+            --max-days "$MAX_DAYS" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Extract Cadastre AIS for planned window
+        id: extract
+        if: ${{ steps.plan.outputs.need_extract == 'true' }}
+        run: |
+          set -euo pipefail
+          echo "Extract ${{ steps.plan.outputs.extract_reason }}: ${{ steps.plan.outputs.extract_start }} → ${{ steps.plan.outputs.extract_end }}"
+          python3 scripts/extract_ais.py \
+            --start "${{ steps.plan.outputs.extract_start }}" \
+            --end "${{ steps.plan.outputs.extract_end }}" \
+            --workers 6 \
+            --replace-aisstream \
+            --accepted-names deploy/accepted_names.json
+          python3 scripts/ais_daily_archive.py range \
+            --ais-dir data/processed/ais_daily \
+            --github-output "$GITHUB_OUTPUT"
+          echo "extracted=true" >> "$GITHUB_OUTPUT"
+
+      - name: Pack ais_daily archive
+        id: pack
+        run: |
+          set -euo pipefail
+          N=$(find data/processed/ais_daily -name 'ais_*.parquet' 2>/dev/null | wc -l | tr -d ' ' || true)
+          echo "parquet_days=${N:-0}"
+          if [ "${N:-0}" -eq 0 ]; then
+            echo "packed=false" >> "$GITHUB_OUTPUT"
+            echo "No parquet yet — nothing to pack."
+            exit 0
+          fi
+          set +e
+          python3 scripts/ais_daily_archive.py pack \
+            --ais-dir data/processed/ais_daily \
+            --out "data/processed/$ARCHIVE_NAME" \
+            --min-files 3500
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "packed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 2 ]; then
+            echo "packed=false" >> "$GITHUB_OUTPUT"
+            echo "Refused to pack/upload until >= 3500 days. Catch-up stays in the Actions cache."
+          else
+            echo "packed=false" >> "$GITHUB_OUTPUT"
+            echo "Pack failed (exit $rc)."
+            exit "$rc"
+          fi
+
+      - name: Upload / update GitHub Release asset
+        if: ${{ steps.pack.outputs.packed == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="Fleet-filtered SoCal ais_daily parquet archive.
+          Auto-updated by public Cadastre extract. Do not edit by hand.
+          Not the national Cadastre. Live websocket shards stay on aisstream-collector.
+          Coverage: $(python3 scripts/ais_daily_archive.py range --ais-dir data/processed/ais_daily)"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "data/processed/$ARCHIVE_NAME" --clobber
+            gh release edit "$RELEASE_TAG" --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" "data/processed/$ARCHIVE_NAME" \
+              --title "AIS daily parquet archive" \
+              --notes "$NOTES"
+          fi
+
+      - name: Decide whether to save cache
+        id: cache-save-gate
+        if: always()
+        run: |
+          set -euo pipefail
+          N=$(find data/processed/ais_daily -name 'ais_*.parquet' 2>/dev/null | wc -l | tr -d ' ' || true)
+          echo "n_files=${N:-0}" >> "$GITHUB_OUTPUT"
+          if [ "${N:-0}" -gt 0 ]; then
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "save=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Save after a real extract (including a failed chunk, so finished days
+      # are not redone) and when the cache missed but a Release unpacked.
+      # Skip the no-op case where today's cache hit and nothing was extracted.
+      - name: Save ais_daily cache
+        if: >-
+          always() &&
+          steps.cache-save-gate.outputs.save == 'true' &&
+          (steps.extract.outcome == 'success' ||
+           steps.extract.outcome == 'failure' ||
+           steps.cache-restore.outputs.cache-hit != 'true')
+        uses: actions/cache/save@v4
+        with:
+          path: data/processed/ais_daily
+          key: ais-daily-v2-${{ github.run_id }}

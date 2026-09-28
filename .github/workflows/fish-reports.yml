@@ -1,0 +1,88 @@
+name: Dock fish-report window
+
+# Public Actions minutes. Fresh trailing scrape of socalfishreports.com dock
+# totals for the target cities. Publishes the whole window each run (not a
+# delta) as Release tag fish-reports-latest / asset fish_reports_window.jsonl.
+#
+# Private FishScraper replaces those calendar dates in its yearly shards.
+# This job does not rebuild the map or deploy Cloudflare.
+#
+# Cron is 15 minutes past the public aisstream-collector handoffs, before
+# private aisstream-ingest at :45. UTC hour 15 uses 21 Pacific days; every
+# other scheduled hour uses 2 Pacific days.
+
+on:
+  schedule:
+    - cron: "15 0,5,10,15,20 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Trailing Pacific days (blank = 21 when UTC hour is 15, else 2)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fish-reports
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: fish-reports-latest
+  ARCHIVE_NAME: fish_reports_window.jsonl
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Scrape a fresh trailing window
+        env:
+          WINDOW_DAYS: ${{ github.event.inputs.days || '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/raw/fish_reports
+          args=(
+            --publish-window "data/raw/fish_reports/$ARCHIVE_NAME"
+            --workers 4
+          )
+          if [ -n "${WINDOW_DAYS}" ]; then
+            args+=(--days "$WINDOW_DAYS")
+          fi
+          python3 scripts/scrape_fish_reports.py "${args[@]}"
+
+      - name: Upload / update GitHub Release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="Trailing socalfishreports.com dock totals (full window, not a delta).
+          Target cities only. Private FishScraper replaces these calendar dates.
+          $(cat data/raw/fish_reports/window_summary.json)"
+          ASSET="data/raw/fish_reports/$ARCHIVE_NAME"
+          if [ ! -f "$ASSET" ]; then
+            echo "::error::Missing $ASSET"
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ASSET" --clobber
+            gh release edit "$RELEASE_TAG" --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" "$ASSET" \
+              --title "Dock fish-report window" \
+              --notes "$NOTES"
+          fi
