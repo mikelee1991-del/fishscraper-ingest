@@ -1,0 +1,373 @@
+name: aisstream live ingest
+
+# Merge aisstream collect shards (public mikelee1991-del/aisstream-collector
+# Release aisstream-live) into private FishScraper and refresh map/Catch.
+#
+# This public repo pays the Actions minutes. The job checks out FishScraper
+# with a write deploy key and pushes main back over SSH. No FishScraper
+# source or data is stored in this repo.
+#
+# Do not deploy the Worker from here. A deploy-key push to FishScraper main
+# starts that repo's deploy-worker.yml, which uses its own secrets.
+#
+# Logs on this repo are world-readable. Do not trace commands. Do not print
+# registries, vessel identifiers, spots, or file contents.
+
+on:
+  schedule:
+    # After public collect handoffs (~00:15/05:15/10:15/15:15/20:15 UTC)
+    - cron: "45 0,5,10,15,20 * * *"
+    # 11:30 PM PDT / 10:30 PM PST end-of-day sweep
+    - cron: "30 6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/aisstream-ingest.yml"
+  workflow_dispatch:
+    inputs:
+      scrape_days:
+        description: "Only used when private_fish_scrape=true (public ingest owns the scheduled scrape)"
+        required: false
+        default: "2"
+      private_fish_scrape:
+        description: "Scrape dock reports in this job if fish-reports-latest is missing"
+        required: false
+        default: "false"
+      force_rebuild:
+        description: "Rebuild map even if no new live shards"
+        required: false
+        default: "false"
+
+# contents: read is enough for public Release downloads. The FishScraper
+# push uses the deploy key, not GITHUB_TOKEN. cache-mode: write is what
+# saves data/processed/ais_daily (caches are per-repo; the first run
+# restores from the public ais-daily-archive Release).
+permissions:
+  contents: read
+
+cache-mode: write
+
+# FishScraper Cadastre watch uses concurrency group ais-watch. That group
+# cannot be shared across repositories. Push races are handled by the
+# rebase / reset --soft step below.
+concurrency:
+  group: aisstream-ingest
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ais-daily-archive
+  ARCHIVE_NAME: ais_daily.tar.zst
+  INGEST_REPO: mikelee1991-del/fishscraper-ingest
+  LIVE_RELEASE: aisstream-live
+  LIVE_REPO: mikelee1991-del/aisstream-collector
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Install public log filter
+        run: |
+          cat > "$RUNNER_TEMP/public_log_filter.py" << 'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          MMSI = re.compile(r"\b\d{9}\b")
+          # Decimal degrees (spots). Counts and timestamps do not look like this.
+          COORD = re.compile(r"-?\d{1,3}\.\d{3,}")
+          SENSITIVE = re.compile(
+              r"\b(boat_name|latitude|longitude|vessel_name|call_sign|ais_vessel_name)\b",
+              re.I,
+          )
+          JSON_KEY = re.compile(
+              r'"(lat|lon|mmsi|boat_name|vessel_name|ais_vessel_name|call_sign)"\s*:',
+              re.I,
+          )
+          DIFF = ("+", "-", "@@", "<<<<<<<", ">>>>>>>", "=======")
+
+          def safe_lines(text: str):
+              for line in text.splitlines():
+                  if line.startswith(DIFF) or MMSI.search(line) or COORD.search(line):
+                      continue
+                  if SENSITIVE.search(line) or JSON_KEY.search(line):
+                      continue
+                  if len(line) > 240:
+                      continue
+                  yield line
+
+          def main() -> None:
+              path = Path(sys.argv[1])
+              text = path.read_text(errors="replace") if path.exists() else ""
+              for line in safe_lines(text):
+                  print(line)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Checkout FishScraper
+        uses: actions/checkout@v4
+        with:
+          repository: mikelee1991-del/FishScraper
+          ssh-key: ${{ secrets.FISHSCRAPER_DEPLOY_KEY }}
+          ref: main
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore ais_daily cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data/processed/ais_daily
+          key: ais-daily-v2-live-ingest
+          restore-keys: |
+            ais-daily-v2-
+            ais-daily-
+
+      - name: Restore ais_daily from public ingest
+        id: archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Used only if the legacy private Release path records a source.
+          # That path is forced closed below. Later steps keep the Actions
+          # default (this public repo) so status links point at this run.
+          GITHUB_REPOSITORY: mikelee1991-del/FishScraper
+        run: |
+          set -euo pipefail
+          bindir="$RUNNER_TEMP/gh-public-only-bin"
+          mkdir -p "$bindir"
+          cat > "$bindir/gh" << 'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          real_gh="${GH_REAL:-/usr/bin/gh}"
+          if [ "${1:-}" = "release" ]; then
+            for arg in "$@"; do
+              case "$arg" in
+                -R|--repo|-R*|--repo=*) exec "$real_gh" "$@" ;;
+              esac
+            done
+            echo "::warning::Legacy private FishScraper Release is not readable from this public job (deploy key is git-over-SSH only)."
+            exit 1
+          fi
+          exec "$real_gh" "$@"
+          EOF
+          chmod 755 "$bindir/gh"
+          log="$RUNNER_TEMP/restore-ais.log"
+          # restore_ais_daily_release.sh falls back to `gh release` with no -R,
+          # which follows the FishScraper checkout. The wrapper makes that
+          # fail so the script takes its "none" path (a warning, cache left
+          # as-is) instead of exiting the job. Public -R downloads still run.
+          set +e
+          PATH="$bindir:$PATH" bash scripts/restore_ais_daily_release.sh >"$log" 2>&1
+          rc=$?
+          set -e
+          python3 "$RUNNER_TEMP/public_log_filter.py" "$log"
+          if [ "$rc" -ne 0 ]; then
+            if grep -q 'Archive source choice: private' "$log" || grep -q 'deploy key is git-over-SSH only' "$log"; then
+              echo "::warning::Legacy private ais-daily-archive fallback failed (exit ${rc}). This public job cannot read FishScraper Releases. Leaving the Actions cache as-is."
+              if [ -n "${GITHUB_OUTPUT:-}" ] && ! grep -q '^archive_changed=' "$GITHUB_OUTPUT"; then
+                printf '%s\n' 'archive_source=none' 'archive_changed=false' 'archive_n=0' 'archive_repo=' >> "$GITHUB_OUTPUT"
+              fi
+            else
+              echo "::error::ais_daily restore failed (exit ${rc})."
+              exit "$rc"
+            fi
+          fi
+
+      - name: Merge aisstream live shards
+        id: live
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p data/processed/ais_live
+          echo "merged=false" >> "$GITHUB_OUTPUT"
+          if ! gh release view "$LIVE_RELEASE" -R "$LIVE_REPO" >/dev/null 2>&1; then
+            echo "No $LIVE_REPO $LIVE_RELEASE release yet — skip live merge."
+            exit 0
+          fi
+          gh release download "$LIVE_RELEASE" -R "$LIVE_REPO" -p "live-*.parquet" -D data/processed/ais_live || true
+          gh release download "$LIVE_RELEASE" -R "$LIVE_REPO" -p "status.json" -D data/processed/ais_live || true
+          shopt -s nullglob
+          shards=(data/processed/ais_live/live-*.parquet data/processed/ais_live/ais_*.parquet)
+          if [ "${#shards[@]}" -eq 0 ]; then
+            echo "No live parquet shards to merge."
+            exit 0
+          fi
+          log="$RUNNER_TEMP/merge-live.log"
+          python3 scripts/merge_ais_daily.py \
+            --src data/processed/ais_live \
+            --dst data/processed/ais_daily \
+            --github-output "$GITHUB_OUTPUT" >"$log" 2>&1
+          python3 "$RUNNER_TEMP/public_log_filter.py" "$log"
+          # Collector often cancels before writing status.json; synthesize from shards
+          # so the map is not stuck on a stale "empty" badge.
+          log="$RUNNER_TEMP/refresh-status.log"
+          python3 scripts/refresh_aisstream_status_from_shards.py \
+            --shards-dir data/processed/ais_live \
+            --prefer data/processed/ais_live/status.json \
+            --out docs/data/aisstream_status.json >"$log" 2>&1
+          python3 "$RUNNER_TEMP/public_log_filter.py" "$log"
+          # Prune needs write on the public repo; GITHUB_TOKEN usually cannot.
+          shopt -s nullglob
+          for f in data/processed/ais_live/live-*.parquet; do
+            gh release delete-asset "$LIVE_RELEASE" "$(basename "$f")" -R "$LIVE_REPO" --yes || true
+          done
+
+      - name: Local ais_daily coverage
+        id: local
+        run: |
+          python3 scripts/ais_daily_archive.py range \
+            --ais-dir data/processed/ais_daily \
+            --github-output "$GITHUB_OUTPUT"
+          N=$(ls data/processed/ais_daily/ais_*.parquet 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${N:-0}" -ge 3500 ]; then
+            echo "archive_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "archive_ready=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "archive_days=${N:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump PILOT_AIS_END to local archive end
+        id: bump
+        run: |
+          set -euo pipefail
+          END="${{ steps.local.outputs.local_end }}"
+          if [ -z "$END" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/ais_daily_archive.py bump-config --end "$END"
+          if git diff --quiet scripts/config.py; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "end=$END" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull fish reports from public ingest + Catch summary
+        id: fish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCRAPE_DAYS: ${{ github.event.inputs.scrape_days || '2' }}
+          PRIVATE_SCRAPE: ${{ github.event.inputs.private_fish_scrape || 'false' }}
+        run: |
+          set -euo pipefail
+          run_filtered() {
+            log="$1"
+            shift
+            set +e
+            "$@" >"$log" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              python3 "$RUNNER_TEMP/public_log_filter.py" "$log"
+            else
+              echo "::error::command failed (exit ${rc}). Output omitted from the public log."
+            fi
+            return "$rc"
+          }
+          run_filtered "$RUNNER_TEMP/pull-fish.log" bash scripts/pull_fish_reports_release.sh
+          run_filtered "$RUNNER_TEMP/homeport.log" python3 scripts/build_homeport_summary.py
+          run_filtered "$RUNNER_TEMP/catch.log" python3 scripts/build_catch_trends.py
+
+      - name: Rebuild stops, map docs, courses
+        id: rebuild
+        if: ${{ steps.live.outputs.merged == 'true' || steps.bump.outputs.changed == 'true' || steps.archive.outputs.archive_changed == 'true' || github.event.inputs.force_rebuild == 'true' || github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          N="${{ steps.local.outputs.archive_days }}"
+          if [ "${N:-0}" -lt 3500 ]; then
+            echo "rebuilt=false" >> "$GITHUB_OUTPUT"
+            echo "ais_daily has ${N:-0} days (<3500). Skip rebuild so 2015+ map docs are not replaced with a 2024 slice."
+            exit 0
+          fi
+          run_filtered() {
+            log="$1"
+            shift
+            set +e
+            "$@" >"$log" 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              python3 "$RUNNER_TEMP/public_log_filter.py" "$log"
+            else
+              echo "::error::command failed (exit ${rc}). Output omitted from the public log."
+            fi
+            return "$rc"
+          }
+          run_filtered "$RUNNER_TEMP/refine.log" python3 scripts/refine_registry.py
+          run_filtered "$RUNNER_TEMP/stops.log" python3 scripts/detect_stops.py
+          run_filtered "$RUNNER_TEMP/map.log" python3 scripts/build_map_data.py
+          run_filtered "$RUNNER_TEMP/courses.log" python3 scripts/build_courses_data.py || echo "::warning::build_courses_data.py failed; map commit continues."
+          echo "rebuilt=true" >> "$GITHUB_OUTPUT"
+
+      # Do not repack or upload ais-daily-archive from this job.
+      # fishscraper-ingest's Cadastre workflow owns that Release.
+      - name: Save ais_daily cache
+        if: ${{ steps.local.outputs.local_n >= 3500 && (steps.live.outputs.merged == 'true' || steps.archive.outputs.archive_changed == 'true' || steps.cache-restore.outputs.cache-hit != 'true') }}
+        uses: actions/cache/save@v4
+        with:
+          path: data/processed/ais_daily
+          key: ais-daily-v2-${{ steps.local.outputs.local_end || github.run_id }}
+
+      - name: Commit docs + config
+        id: commit
+        run: |
+          set -euo pipefail
+          # Always land on FishScraper main. github.ref_name is this public
+          # repo's ref, which is not a FishScraper branch.
+          FISH_REF=main
+          url="$(git remote get-url origin)"
+          case "$url" in
+            git@github.com:mikelee1991-del/FishScraper|git@github.com:mikelee1991-del/FishScraper.git)
+              echo "origin=ssh FishScraper"
+              ;;
+            *)
+              echo "::error::origin is not the FishScraper SSH remote."
+              exit 1
+              ;;
+          esac
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data/ scripts/config.py || true
+          git add data/raw/fish_reports/by_year/*.jsonl 2>/dev/null || true
+          # refine_registry.py also writes mmsi_rejected.json (tracked). Leaving it
+          # dirty blocks `git pull --rebase` after Cadastre watch updates main.
+          git add data/processed/offshore_stops.json \
+            data/processed/vessel_mmsi_registry.json \
+            data/processed/mmsi_rejected.json \
+            data/processed/join_debug.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No committed outputs changed."
+          else
+            git -c commit.verbose=false commit -m "chore: ingest aisstream live AIS + refresh map/Catch"
+            pull_log="$RUNNER_TEMP/git-pull.log"
+            if ! git pull --rebase --autostash origin "$FISH_REF" >"$pull_log" 2>&1 \
+              && ! git pull --rebase --autostash origin main >"$pull_log" 2>&1; then
+              # Generated JSON from Cadastre watch cannot merge line-wise.
+              # Keep this job's full rebuild on top of latest origin.
+              # Do not print the rebase diff (it can contain vessel and spot data).
+              echo "Rebase conflicted with origin; prefer this job's rebuild."
+              python3 "$RUNNER_TEMP/public_log_filter.py" "$pull_log" || true
+              git rebase --abort || true
+              git fetch origin "$FISH_REF" || git fetch origin main
+              git reset --soft "origin/$FISH_REF" || git reset --soft origin/main
+              git -c commit.verbose=false commit -m "chore: ingest aisstream live AIS + refresh map/Catch"
+            else
+              echo "Rebase ok."
+            fi
+            git push || git push origin "HEAD:${FISH_REF}"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
