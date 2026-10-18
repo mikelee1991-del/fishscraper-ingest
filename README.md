@@ -1,18 +1,18 @@
 # fishscraper-ingest
 
-Public Marine Cadastre extract and dock-report scrape for [FishScraper](https://github.com/mikelee1991-del/FishScraper).
+Public Marine Cadastre extract, dock-report scrape, and aisstream live ingest for [FishScraper](https://github.com/mikelee1991-del/FishScraper).
 
-FishScraper stays **private**. This repo is **public** so those HTTP jobs spend public Actions minutes instead of the private-repo quota. It does not rebuild the map and it does not deploy the Cloudflare Worker.
+FishScraper stays **private**. This repo is **public** so those jobs spend public Actions minutes instead of the private-repo quota. Live ingest checks out FishScraper over SSH, rebuilds stops/map/Catch there, and pushes `main`. This repo does not deploy the Cloudflare Worker and does not store Worker tokens. A deploy-key push to FishScraper `main` starts that repo's own deploy workflow.
 
 ## Three repos
 
 | Repo | Visibility | Owns |
 |------|------------|------|
 | [aisstream-collector](https://github.com/mikelee1991-del/aisstream-collector) | Public | Live aisstream.io websocket. Release **`aisstream-live`**. |
-| **fishscraper-ingest** (this repo) | Public | NOAA Marine Cadastre extract and the trailing dock-report scrape. |
-| FishScraper | Private | Download these Releases, merge live shards, rebuild stops/map/Catch, deploy the Worker. |
+| **fishscraper-ingest** (this repo) | Public | NOAA Marine Cadastre extract, the trailing dock-report scrape, and the aisstream live ingest job. |
+| FishScraper | Private | Stops, map, Catch, and registries. Ingest commits land on `main` here. Its deploy workflow publishes the Worker. |
 
-The live socket stays on aisstream-collector. Do not move it here, and do not add `AISSTREAM_API_KEY`, `CLOUDFLARE_API_TOKEN`, or `CLOUDFLARE_ACCOUNT_ID` to this repo. Cadastre and socalfishreports.com are public HTTP.
+The live socket stays on aisstream-collector. Do not move it here, and do not add `AISSTREAM_API_KEY`, `CLOUDFLARE_API_TOKEN`, or `CLOUDFLARE_ACCOUNT_ID` to this repo. Cadastre and socalfishreports.com are public HTTP. Ingest does not copy FishScraper source or data into this repo.
 
 ## Releases
 
@@ -31,10 +31,15 @@ Rows are limited to the SoCal bbox and the fleet allowlist (`deploy/accepted_nam
 |----------|------------|----------------|
 | Cadastre AIS extract | `0 15 * * *` | Probe Cadastre, restore Actions cache, unpack this repo's Release on top (extra days are kept), extract up to **800** days with **6** workers and `--replace-aisstream`, timeout **360** minutes. Upload `ais-daily-archive` only at ≥3500 days. Until then the chunk stays in the `ais-daily-v2-` cache. |
 | Dock fish-report window | `15 0,5,10,15,20 * * *` | Fresh scrape. **2** Pacific days, except the **15:xx UTC** run which uses **21** Pacific days. Uploads the whole window every time. |
+| Aisstream live ingest | `45 0,5,10,15,20 * * *` and `30 6 * * *` | Check out FishScraper `main` with the deploy key, merge `aisstream-live` shards, pull this repo's Releases, rebuild when the archive or live shards change, push `main`. Timeout **120** minutes. Does not deploy the Worker from this repo. |
 
-Both workflows also have **workflow_dispatch**. Cadastre dispatch input `max_extract_days` defaults to 800. Fish-report dispatch input `days` overrides the 21/2 rule when set.
+All three workflows also have **workflow_dispatch**. Cadastre dispatch input `max_extract_days` defaults to 800. Fish-report dispatch input `days` overrides the 21/2 rule when set. Ingest dispatch inputs are `scrape_days` (default **2**, used only when `private_fish_scrape` is true), `private_fish_scrape` (default **false**), and `force_rebuild` (default **false**).
 
-Cadastre cron is 15:00 UTC, before private `ais-watch` at 15:30 UTC. The dock cron is at :15, before private `aisstream-ingest` at :45.
+Cadastre cron is 15:00 UTC, before private `ais-watch` at 15:30 UTC. The dock cron is at :15, before aisstream live ingest at :45.
+
+Ingest logs are public. The job prints counts and `changed=true` / `changed=false`. It does not print registries, vessel identifiers, spots, or file contents. After this workflow is green, disable the copy of the job on private FishScraper so both sides do not push `main`.
+
+The legacy private `ais-daily-archive` Release is not readable from this job (the deploy key is git-over-SSH only). The public archive is the source. If that asset is missing or under **3500** days, the job warns and leaves the Actions cache as-is instead of failing.
 
 ## Sync the fleet when boats change
 
@@ -108,13 +113,13 @@ After the seed, the next Cadastre run unpacks those 4122 days, extracts only the
 
 ## Actions permissions
 
-Workflows request `contents: write` so they can publish Releases. If an upload fails with a token permission error:
+Cadastre and dock-report workflows request `contents: write` so they can publish Releases. Aisstream live ingest requests `contents: read` only. It pushes FishScraper with the deploy key, not `GITHUB_TOKEN`. It sets `cache-mode: write` so the `ais_daily` cache can be saved. If a Release upload fails with a token permission error:
 
 1. This repo → **Settings → Actions → General**
 2. **Workflow permissions** → **Read and write permissions**
 3. Save
 
-No other secrets are required. Enable Actions if GitHub asks on the first run.
+Ingest needs the repo secret `FISHSCRAPER_DEPLOY_KEY` (a write deploy key on FishScraper, git-over-SSH only). It is already configured. Do not print it, and do not add Worker tokens or `AISSTREAM_API_KEY` here. Enable Actions if GitHub asks on the first run.
 
 ## Local checks
 
