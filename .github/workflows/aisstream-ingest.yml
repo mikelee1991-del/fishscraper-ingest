@@ -39,13 +39,13 @@ on:
         default: "false"
 
 # contents: read is enough for public Release downloads. The FishScraper
-# push uses the deploy key, not GITHUB_TOKEN. cache-mode: write is what
-# saves data/processed/ais_daily (caches are per-repo; the first run
-# restores from the public ais-daily-archive Release).
+# push uses the deploy key, not GITHUB_TOKEN. data/processed/ais_daily is
+# restored only from the public ais-daily-archive Release (ais_daily.tar.zst).
+# cache-mode: none disables Actions cache save and restore for this workflow.
 permissions:
   contents: read
 
-cache-mode: write
+cache-mode: none
 
 # FishScraper Cadastre watch uses concurrency group ais-watch. That group
 # cannot be shared across repositories. Push races are handled by the
@@ -124,16 +124,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore ais_daily cache
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: data/processed/ais_daily
-          key: ais-daily-v2-live-ingest
-          restore-keys: |
-            ais-daily-v2-
-            ais-daily-
-
       - name: Restore ais_daily from public ingest
         id: archive
         env:
@@ -165,8 +155,8 @@ jobs:
           log="$RUNNER_TEMP/restore-ais.log"
           # restore_ais_daily_release.sh falls back to `gh release` with no -R,
           # which follows the FishScraper checkout. The wrapper makes that
-          # fail so the script takes its "none" path (a warning, cache left
-          # as-is) instead of exiting the job. Public -R downloads still run.
+          # fail closed. A private-only failure is a warning so the job can
+          # continue on the public Release unpack. Public -R downloads still run.
           set +e
           PATH="$bindir:$PATH" bash scripts/restore_ais_daily_release.sh >"$log" 2>&1
           rc=$?
@@ -174,7 +164,7 @@ jobs:
           python3 "$RUNNER_TEMP/public_log_filter.py" "$log"
           if [ "$rc" -ne 0 ]; then
             if grep -q 'Archive source choice: private' "$log" || grep -q 'deploy key is git-over-SSH only' "$log"; then
-              echo "::warning::Legacy private ais-daily-archive fallback failed (exit ${rc}). This public job cannot read FishScraper Releases. Leaving the Actions cache as-is."
+              echo "::warning::Legacy private ais-daily-archive fallback failed (exit ${rc}). This public job cannot read FishScraper Releases. ais_daily comes only from the public Release. The 3500-day guard still skips the map rebuild if that restore did not land a full archive."
               if [ -n "${GITHUB_OUTPUT:-}" ] && ! grep -q '^archive_changed=' "$GITHUB_OUTPUT"; then
                 printf '%s\n' 'archive_source=none' 'archive_changed=false' 'archive_n=0' 'archive_repo=' >> "$GITHUB_OUTPUT"
               fi
@@ -314,13 +304,7 @@ jobs:
 
       # Do not repack or upload ais-daily-archive from this job.
       # fishscraper-ingest's Cadastre workflow owns that Release.
-      - name: Save ais_daily cache
-        if: ${{ steps.local.outputs.local_n >= 3500 && (steps.live.outputs.merged == 'true' || steps.archive.outputs.archive_changed == 'true' || steps.cache-restore.outputs.cache-hit != 'true') }}
-        uses: actions/cache/save@v4
-        with:
-          path: data/processed/ais_daily
-          key: ais-daily-v2-${{ steps.local.outputs.local_end || github.run_id }}
-
+      # Do not save data/processed/ais_daily to the Actions cache.
       - name: Commit docs + config
         id: commit
         run: |

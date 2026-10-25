@@ -132,7 +132,11 @@ def main() -> None:
     assert "max_extract_days" in cadastre
     assert 'default: "800"' in cadastre
     assert "workflow_dispatch" in cadastre
-    assert "actions: write" in cadastre
+    assert "actions: write" not in cadastre
+    assert "actions/cache" not in cadastre
+    assert "ais-daily-v2" not in cadastre
+    assert "cache-mode: none" in cadastre
+    assert "ais_daily_archive.py unpack" in cadastre
     assert "extract_ais.py" in cadastre
     assert "aisstream-collector" in cadastre
 
@@ -157,6 +161,8 @@ def main() -> None:
     assert "aisstream-collector" in readme
     assert "stays private" in readme.lower() or "stays **private**" in readme
     assert "3500" in readme
+    assert "ais-daily-v2" not in readme
+    assert "cache-mode: none" in readme
     assert "accepted_names.json" in readme
     assert "FISHSCRAPER_DEPLOY_KEY" in readme
     assert '45 0,5,10,15,20 * * *' in readme
@@ -180,7 +186,10 @@ def main() -> None:
     assert "GITHUB_REPOSITORY: mikelee1991-del/FishScraper" in ingest
     assert "contents: read" in ingest
     assert "contents: write" not in ingest
-    assert "cache-mode: write" in ingest
+    assert "cache-mode: none" in ingest
+    assert "cache-mode: write" not in ingest
+    assert "actions/cache" not in ingest
+    assert "ais-daily-v2" not in ingest
     assert "group: aisstream-ingest" in ingest
     assert "group: ais-watch" not in ingest
     assert "actions/checkout@v4" in ingest
