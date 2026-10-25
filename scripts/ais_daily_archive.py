@@ -3,7 +3,8 @@
 
 The archive is ~0.5–0.7 GB — too large for normal git history (and free Git LFS
 bandwidth is too tight for daily CI checkouts). Persist it as a GitHub Release
-asset + Actions cache instead; only docs/ outputs are committed.
+asset. Do not save or restore it with the Actions cache. Only docs/ outputs
+are committed.
 
 Release contract (private FishScraper consumes this):
   tag ais-daily-archive / asset ais_daily.tar.zst

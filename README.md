@@ -29,7 +29,7 @@ Rows are limited to the SoCal bbox and the fleet allowlist (`deploy/accepted_nam
 
 | Workflow | Cron (UTC) | What it does |
 |----------|------------|----------------|
-| Cadastre AIS extract | `0 15 * * *` | Probe Cadastre, restore Actions cache, unpack this repo's Release on top (extra days are kept), extract up to **800** days with **6** workers and `--replace-aisstream`, timeout **360** minutes. Upload `ais-daily-archive` only at ≥3500 days. Until then the chunk stays in the `ais-daily-v2-` cache. |
+| Cadastre AIS extract | `0 15 * * *` | Probe Cadastre, restore `data/processed/ais_daily` only from this repo's `ais-daily-archive` Release (`ais_daily.tar.zst`), extract up to **800** days with **6** workers and `--replace-aisstream`, timeout **360** minutes. Upload `ais-daily-archive` only at ≥3500 days. No Actions cache for that folder. |
 | Dock fish-report window | `15 0,5,10,15,20 * * *` | Fresh scrape. **2** Pacific days, except the **15:xx UTC** run which uses **21** Pacific days. Uploads the whole window every time. |
 | Aisstream live ingest | `45 0,5,10,15,20 * * *` and `30 6 * * *` | Check out FishScraper `main` with the deploy key, merge `aisstream-live` shards, pull this repo's Releases, rebuild when the archive or live shards change, push `main`. Timeout **120** minutes. Does not deploy the Worker from this repo. |
 
@@ -39,7 +39,7 @@ Cadastre cron is 15:00 UTC, before private `ais-watch` at 15:30 UTC. The dock cr
 
 Ingest logs are public. The job prints counts and `changed=true` / `changed=false`. It does not print registries, vessel identifiers, spots, or file contents. After this workflow is green, disable the copy of the job on private FishScraper so both sides do not push `main`.
 
-The legacy private `ais-daily-archive` Release is not readable from this job (the deploy key is git-over-SSH only). The public archive is the source. If that asset is missing or under **3500** days, the job warns and leaves the Actions cache as-is instead of failing.
+The legacy private `ais-daily-archive` Release is not readable from this job (the deploy key is git-over-SSH only). The public archive is the only `ais_daily` source. If that asset is missing or under **3500** days, the job warns and the 3500-day guard skips the map rebuild.
 
 ## Sync the fleet when boats change
 
@@ -72,7 +72,7 @@ Public Actions cannot read private FishScraper Releases. The private tag `ais-da
 - coverage **2015-01-01 → 2026-09-17**, **4122** days (≥3500)
 - sha256 `dae89662ae4803670d38f0c25fd6e3da7df379defa847dd1201ffd54770fa259`
 
-A cloud agent that can see FishScraper metadata still could not download that asset with this repo's credentials. Until Mike copies it, this repo's Cadastre job grows the archive in the Actions cache and does not upload a narrow slice. Private watch/ingest keep using FishScraper's own Release until a public asset has ≥3500 days.
+A cloud agent that can see FishScraper metadata still could not download that asset with this repo's credentials. Until Mike copies it, this repo's Cadastre job does not upload a narrow slice. It does not keep catch-up days in an Actions cache. Private watch/ingest keep using FishScraper's own Release until a public asset has ≥3500 days.
 
 From a machine logged in as **mikelee1991-del** (read on FishScraper, write on this repo):
 
@@ -113,7 +113,7 @@ After the seed, the next Cadastre run unpacks those 4122 days, extracts only the
 
 ## Actions permissions
 
-Cadastre and dock-report workflows request `contents: write` so they can publish Releases. Aisstream live ingest requests `contents: read` only. It pushes FishScraper with the deploy key, not `GITHUB_TOKEN`. It sets `cache-mode: write` so the `ais_daily` cache can be saved. If a Release upload fails with a token permission error:
+Cadastre and dock-report workflows request `contents: write` so they can publish Releases. Aisstream live ingest requests `contents: read` only. It pushes FishScraper with the deploy key, not `GITHUB_TOKEN`. Cadastre and ingest set `cache-mode: none` so those workflows cannot save or restore an Actions cache. `ais_daily` comes from the public Release. If a Release upload fails with a token permission error:
 
 1. This repo → **Settings → Actions → General**
 2. **Workflow permissions** → **Read and write permissions**

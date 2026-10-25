@@ -6,9 +6,10 @@ name: Cadastre AIS extract
 # not merge those shards, rebuild the map, or deploy Cloudflare.
 #
 # Daily chunk (same planner as FishScraper watch): up to 800 days, 6 workers,
-# --replace-aisstream. Catch-up stays in the Actions cache until the tree has
-# at least 3500 ais_YYYY-MM-DD.parquet files. Only then do we pack and upload
-# Release tag ais-daily-archive / asset ais_daily.tar.zst.
+# --replace-aisstream. Each run restores data/processed/ais_daily only from
+# Release tag ais-daily-archive / asset ais_daily.tar.zst. There is no Actions
+# cache for that folder. Pack and upload the Release only when the tree has
+# at least 3500 ais_YYYY-MM-DD.parquet files.
 #
 # Cron 15:00 UTC is before private ais-watch at 15:30 UTC.
 
@@ -24,7 +25,9 @@ on:
 
 permissions:
   contents: write
-  actions: write
+
+# No Actions cache for data/processed/ais_daily. The Release is the only copy.
+cache-mode: none
 
 concurrency:
   group: cadastre-extract
@@ -59,22 +62,14 @@ jobs:
             --out docs/data/ais_cadastre_status.json \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Restore ais_daily cache
-        id: cache-restore
-        uses: actions/cache/restore@v4
-        with:
-          path: data/processed/ais_daily
-          key: ais-daily-v2-${{ github.run_id }}
-          restore-keys: |
-            ais-daily-v2-
-
-      - name: Download ais_daily Release archive
+      - name: Restore ais_daily from Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p data/processed
-          # Union with cache: unpack never deletes extra days already on disk.
+          # Only source for data/processed/ais_daily. Unpack keeps days already
+          # on disk and overwrites the same paths. It does not delete extras.
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release download "$RELEASE_TAG" -p "$ARCHIVE_NAME" -D data/processed || true
             if [ -f "data/processed/$ARCHIVE_NAME" ]; then
@@ -82,10 +77,10 @@ jobs:
                 --archive "data/processed/$ARCHIVE_NAME" \
                 --dest data/processed
             else
-              echo "Release exists but asset missing — catch-up stays in cache."
+              echo "Release exists but asset $ARCHIVE_NAME is missing. Nothing restored. Pack still refuses to upload under 3500 days."
             fi
           else
-            echo "No $RELEASE_TAG release yet — catch-up stays in cache until 3500 days."
+            echo "No $RELEASE_TAG release yet. Nothing restored. Pack still refuses to upload under 3500 days."
           fi
 
       - name: Plan extract window
@@ -145,7 +140,7 @@ jobs:
             echo "packed=true" >> "$GITHUB_OUTPUT"
           elif [ "$rc" -eq 2 ]; then
             echo "packed=false" >> "$GITHUB_OUTPUT"
-            echo "Refused to pack/upload until >= 3500 days. Catch-up stays in the Actions cache."
+            echo "Refused to pack/upload until >= 3500 days. Next run restores $RELEASE_TAG again. This job does not save an Actions cache."
           else
             echo "packed=false" >> "$GITHUB_OUTPUT"
             echo "Pack failed (exit $rc)."
@@ -170,31 +165,3 @@ jobs:
               --title "AIS daily parquet archive" \
               --notes "$NOTES"
           fi
-
-      - name: Decide whether to save cache
-        id: cache-save-gate
-        if: always()
-        run: |
-          set -euo pipefail
-          N=$(find data/processed/ais_daily -name 'ais_*.parquet' 2>/dev/null | wc -l | tr -d ' ' || true)
-          echo "n_files=${N:-0}" >> "$GITHUB_OUTPUT"
-          if [ "${N:-0}" -gt 0 ]; then
-            echo "save=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "save=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Save after a real extract (including a failed chunk, so finished days
-      # are not redone) and when the cache missed but a Release unpacked.
-      # Skip the no-op case where today's cache hit and nothing was extracted.
-      - name: Save ais_daily cache
-        if: >-
-          always() &&
-          steps.cache-save-gate.outputs.save == 'true' &&
-          (steps.extract.outcome == 'success' ||
-           steps.extract.outcome == 'failure' ||
-           steps.cache-restore.outputs.cache-hit != 'true')
-        uses: actions/cache/save@v4
-        with:
-          path: data/processed/ais_daily
-          key: ais-daily-v2-${{ github.run_id }}
