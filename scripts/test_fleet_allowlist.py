@@ -9,11 +9,14 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pandas as pd
+
 from config import MMSI_ALLOWLIST, MMSI_DENYLIST, MMSI_TO_REPORT_BOAT  # noqa: E402
 from extract_ais import (  # noqa: E402
     allowlist_is_empty,
     load_fleet_filter,
     require_fleet_filter,
+    select_fleet_rows,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +94,41 @@ def main() -> None:
     assert 338068929 in allow  # Dreamer is on the JSON list
     assert 366760710 not in allow
     assert not allowlist_is_empty(accepted, allow, names)
+
+    # Wrong hulls that share a charter broadcast name. JSON may still list
+    # 368269920; the denylist removes it from the loaded maps.
+    for wrong in (368269920, 366341000):
+        assert wrong in MMSI_DENYLIST
+        assert wrong not in MMSI_ALLOWLIST
+        assert wrong not in MMSI_TO_REPORT_BOAT
+        assert wrong not in allow
+        assert wrong not in names
+    # The names stay, so a different MMSI can still be the charter.
+    assert accepted["SPITFIRE"] == "Spitfire"
+    assert accepted["PRIDE"] == "Pride"
+    assert [key for key, boat in accepted.items() if boat == "Pride"] == ["PRIDE"]
+
+    sample = pd.DataFrame(
+        {
+            "mmsi": [366341000, 367000222, 367000444, 368269920, 367000333, 366855060],
+            "vessel_name": [
+                "PRIDE",
+                "Pride",
+                "M/V PRIDE",
+                "SPITFIRE",
+                "Spitfire",
+                "SOMETHING ELSE",
+            ],
+        }
+    )
+    kept = select_fleet_rows(sample, accepted, allow, names)
+    kept_mmsis = set(kept["mmsi"])
+    assert 366341000 not in kept_mmsis  # tug named PRIDE
+    assert 368269920 not in kept_mmsis  # Newport sailboat named SPITFIRE
+    assert 367000444 not in kept_mmsis  # "M/V PRIDE" is not an alias
+    assert list(kept.loc[kept["mmsi"] == 367000222, "report_boat_name"]) == ["Pride"]
+    assert list(kept.loc[kept["mmsi"] == 367000333, "report_boat_name"]) == ["Spitfire"]
+    assert list(kept.loc[kept["mmsi"] == 366855060, "report_boat_name"]) == ["New Del Mar"]
 
     print("test_fleet_allowlist: ok")
 

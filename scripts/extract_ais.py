@@ -8,7 +8,8 @@ sample). Only rows matching the SoCal bbox and the fleet allowlist are kept.
 The allowlist is ``deploy/accepted_names.json`` (accepted_names,
 mmsi_allowlist, mmsi_to_report_boat) unioned with the MMSI maps in
 ``scripts/config.py``. Extract refuses to run when that union is empty so
-this job cannot publish the national Cadastre firehose.
+this job cannot publish the national Cadastre firehose. ``MMSI_DENYLIST``
+drops a hull even when its broadcast name is an accepted name.
 """
 
 from __future__ import annotations
@@ -123,7 +124,8 @@ def load_fleet_filter(path: Path) -> tuple[dict[str, str], set[int], dict[int, s
 
     JSON boat names overlay config.py when both name the same MMSI. MMSIs are
     unioned so a boat listed in only one file is still extracted. Denied names
-    and MMSIs are removed after the union.
+    and MMSIs are removed after the union. A denied MMSI is also dropped at
+    row filter time, so an accepted broadcast name cannot bring it back.
     """
     if not path.exists():
         raise SystemExit(f"accepted names file not found: {path}")
@@ -148,6 +150,30 @@ def load_fleet_filter(path: Path) -> tuple[dict[str, str], set[int], dict[int, s
         flush=True,
     )
     return accepted, mmsi_allow, mmsi_names
+
+
+def select_fleet_rows(df, accepted: dict[str, str], mmsi_allow: set[int], mmsi_names: dict[int, str]):
+    """Keep bbox rows that match an accepted name or an allowlisted MMSI.
+
+    ``MMSI_DENYLIST`` wins over both. A denied hull that broadcasts a charter
+    name (PRIDE, SPITFIRE, and the other same-name rejects) is dropped. A
+    different MMSI broadcasting that name is still kept.
+    """
+    norms = df["vessel_name"].fillna("").map(normalize_name)
+    allow_mmsis = set(mmsi_allow) | set(mmsi_names)
+    name_hit = norms.isin(set(accepted.keys()))
+    mmsi_hit = df["mmsi"].isin(allow_mmsis)
+    denied = df["mmsi"].isin({int(m) for m in MMSI_DENYLIST})
+    fleet_df = df.loc[(name_hit | mmsi_hit) & ~denied].copy()
+    if fleet_df.empty:
+        return fleet_df
+    fleet_df["vessel_name_norm"] = norms.loc[fleet_df.index].values
+    report_by_mmsi = {int(k): v for k, v in mmsi_names.items()}
+    fleet_df["report_boat_name"] = [
+        report_by_mmsi.get(int(m)) or accepted.get(n)
+        for m, n in zip(fleet_df["mmsi"], fleet_df["vessel_name_norm"])
+    ]
+    return fleet_df
 
 
 def _duckdb_http():
@@ -255,22 +281,13 @@ def extract_day(
                 out_path.unlink()
             return {"date": day.isoformat(), "rows": 0, "path": None, "skipped": False}
 
-        norms = df["vessel_name"].fillna("").map(normalize_name)
-        name_hit = norms.isin(set(accepted.keys()))
-        mmsi_hit = df["mmsi"].isin(set(allow_mmsis))
-        fleet_df = df.loc[name_hit | mmsi_hit].copy()
-        fleet_df["vessel_name_norm"] = norms.loc[fleet_df.index].values
-        report_by_mmsi = {int(k): v for k, v in mmsi_names.items()}
-        fleet_df["report_boat_name"] = [
-            report_by_mmsi.get(int(m)) or accepted.get(n)
-            for m, n in zip(fleet_df["mmsi"], fleet_df["vessel_name_norm"])
-        ]
-        fleet_df["date"] = day.isoformat()
-        fleet_df["ais_source"] = "cadastre"
+        fleet_df = select_fleet_rows(df, accepted, set(allow_mmsis), mmsi_names)
         if fleet_df.empty:
             if out_path.exists():
                 out_path.unlink()
             return {"date": day.isoformat(), "rows": 0, "path": None, "skipped": False}
+        fleet_df["date"] = day.isoformat()
+        fleet_df["ais_source"] = "cadastre"
 
         fleet_df.to_parquet(out_path, index=False)
         return {

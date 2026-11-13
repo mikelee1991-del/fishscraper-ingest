@@ -67,6 +67,7 @@ ACCEPTED_NAME_DENYLIST = {
 }
 
 # MMSIs rejected after inspection (same name as a charter, but wrong vessel).
+# Extract drops these rows even when vessel_name is an accepted name or alias.
 MMSI_DENYLIST = {
     338225409,  # SWEET FREEDOM
     368033280,  # VICTORY recreational
@@ -85,6 +86,8 @@ MMSI_DENYLIST = {
     338477409,  # FURY recreational
     366760710,  # REDONDO — Long Beach towing vessel, not the charter
     368121950,  # MARDIOSA — luxury yacht, not the Long Beach charter
+    368269920,  # SPITFIRE — ~11 m Class B sailboat (type 36) in Newport Harbor, not the Marina del Rey sportfisher
+    366341000,  # PRIDE — 41x13 m towing vessel in the inner LA harbor, last seen 2022; not San Pedro Pride
 }
 
 # Preferred MMSIs when known. Unioned with deploy/accepted_names.json.
@@ -104,7 +107,6 @@ MMSI_ALLOWLIST = {
     367169120,  # TORONADO
     368078070,  # THUNDERBIRD
     366915000,  # EL PATRON
-    368269920,  # SPITFIRE
     366849310,  # DANA PRIDE (Dana Point — not San Pedro Pride)
     367175860,  # INDEPENDENCE
     367576030,  # PATRIOT (Newport)
@@ -127,7 +129,6 @@ MMSI_TO_REPORT_BOAT = {
     367169120: "Toronado",
     368078070: "Thunderbird",
     366915000: "El Patron",
-    368269920: "Spitfire",
     366849310: "Dana Pride",
     368370000: "Apollo",
     338068929: "Dreamer",
