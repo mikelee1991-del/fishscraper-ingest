@@ -1,7 +1,8 @@
 name: aisstream live ingest
 
 # Merge aisstream collect shards (public mikelee1991-del/aisstream-collector
-# Release aisstream-live) into private FishScraper and refresh map/Catch.
+# Release aisstream-live) into private FishScraper and refresh map/Catch,
+# including BoatBoard pin traffic in docs/data/boatboard_spots.json.
 #
 # This public repo pays the Actions minutes. The job checks out FishScraper
 # with a write deploy key and pushes main back over SSH. No FishScraper
@@ -271,7 +272,7 @@ jobs:
           run_filtered "$RUNNER_TEMP/homeport.log" python3 scripts/build_homeport_summary.py
           run_filtered "$RUNNER_TEMP/catch.log" python3 scripts/build_catch_trends.py
 
-      - name: Rebuild stops, map docs, courses
+      - name: Rebuild stops, map docs, courses, boatboard traffic
         id: rebuild
         if: ${{ steps.live.outputs.merged == 'true' || steps.bump.outputs.changed == 'true' || steps.archive.outputs.archive_changed == 'true' || github.event.inputs.force_rebuild == 'true' || github.event_name == 'push' }}
         run: |
@@ -300,6 +301,75 @@ jobs:
           run_filtered "$RUNNER_TEMP/stops.log" python3 scripts/detect_stops.py
           run_filtered "$RUNNER_TEMP/map.log" python3 scripts/build_map_data.py
           run_filtered "$RUNNER_TEMP/courses.log" python3 scripts/build_courses_data.py || echo "::warning::build_courses_data.py failed; map commit continues."
+          # Join pins already in docs/data/boatboard_spots.json. Do not
+          # re-import them. Fishing traffic reads locations.json after
+          # build_map_data.py and the courses visit-date patch. Dive traffic
+          # reads docs/data/diving/heat_stops.json already on main; this job
+          # does not rebuild dive heat. traffic_join.generated_at changes
+          # every run. Restore the previous file when that is the only
+          # difference so it cannot open a commit by itself. Failure restores
+          # the file and does not block the AIS/map commit.
+          spots="docs/data/boatboard_spots.json"
+          spots_log="$RUNNER_TEMP/boatboard-traffic.log"
+          set +e
+          python3 scripts/map_boatboard_traffic.py >"$spots_log" 2>&1
+          spots_rc=$?
+          set -e
+          if [ "$spots_rc" -ne 0 ]; then
+            echo "::warning::map_boatboard_traffic.py failed (exit ${spots_rc}); restoring ${spots}. AIS/map commit continues."
+            git checkout -- "$spots" || true
+          else
+            python3 "$RUNNER_TEMP/public_log_filter.py" "$spots_log" || true
+            cmp_log="$RUNNER_TEMP/boatboard-traffic-compare.log"
+            set +e
+            python3 - << 'SPOTS' >"$cmp_log" 2>&1
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          path = Path("docs/data/boatboard_spots.json")
+
+          def normalize(data):
+              if isinstance(data, dict):
+                  join = data.get("traffic_join")
+                  if isinstance(join, dict):
+                      join.pop("generated_at", None)
+              return data
+
+          try:
+              head = subprocess.check_output(
+                  ["git", "show", "HEAD:docs/data/boatboard_spots.json"],
+                  stderr=subprocess.DEVNULL,
+              )
+          except subprocess.CalledProcessError:
+              print("boatboard_spots: no previous file; keeping join output")
+              sys.exit(0)
+
+          try:
+              new = json.loads(path.read_text())
+              old = json.loads(head)
+          except json.JSONDecodeError:
+              print("boatboard_spots: compare could not parse JSON", file=sys.stderr)
+              sys.exit(1)
+
+          if normalize(new) == normalize(old):
+              subprocess.check_call(
+                  ["git", "checkout", "--", "docs/data/boatboard_spots.json"]
+              )
+              print("boatboard_spots: traffic unchanged; kept previous file")
+          else:
+              print("boatboard_spots: traffic content changed")
+          SPOTS
+            spots_cmp=$?
+            set -e
+            if [ "$spots_cmp" -ne 0 ]; then
+              echo "::warning::boatboard spots compare failed (exit ${spots_cmp}); restoring ${spots}. AIS/map commit continues."
+              git checkout -- "$spots" || true
+            else
+              python3 "$RUNNER_TEMP/public_log_filter.py" "$cmp_log" || true
+            fi
+          fi
           echo "rebuilt=true" >> "$GITHUB_OUTPUT"
 
       # Do not repack or upload ais-daily-archive from this job.
@@ -324,6 +394,9 @@ jobs:
           esac
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # docs/data/ includes boatboard_spots.json when the traffic join
+          # changed. The rebuild step restores a timestamp-only rewrite, so
+          # that file is not staged unless top_boats/traffic content changed.
           git add docs/data/ scripts/config.py || true
           git add data/raw/fish_reports/by_year/*.jsonl 2>/dev/null || true
           # refine_registry.py also writes mmsi_rejected.json (tracked). Leaving it
