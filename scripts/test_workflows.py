@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import tempfile
@@ -117,6 +118,76 @@ def _check_gh_wrapper(workflow: str) -> None:
         assert "api user" in log.read_text()
 
 
+def _check_spots_churn(workflow: str) -> None:
+    """Timestamp-only boatboard_spots rewrites must not stay dirty."""
+    script = _heredoc(workflow, "SPOTS")
+    assert "generated_at" in script
+    assert "traffic content changed" in script
+    sample = {
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "fish": [{"name": "Reef", "traffic": {"intensity": 1.0, "top_boats": []}}],
+        "dive": [],
+        "traffic_join": {
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "fish_sites_with_traffic": 1,
+        },
+        "top_fish_by_traffic": [{"name": "Reef", "intensity": 1.0}],
+    }
+
+    def run(repo: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", "-c", script],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        spots = repo / "docs" / "data" / "boatboard_spots.json"
+        spots.parent.mkdir(parents=True)
+        spots.write_text(json.dumps(sample) + "\n")
+        subprocess.check_call(["git", "init", "-q"], cwd=repo)
+        subprocess.check_call(["git", "config", "user.email", "test@example.com"], cwd=repo)
+        subprocess.check_call(["git", "config", "user.name", "test"], cwd=repo)
+        subprocess.check_call(["git", "config", "commit.gpgsign", "false"], cwd=repo)
+        subprocess.check_call(["git", "add", "docs/data/boatboard_spots.json"], cwd=repo)
+        subprocess.check_call(
+            ["git", "commit", "-q", "-m", "spots"],
+            cwd=repo,
+        )
+        original = spots.read_text()
+
+        stamped = json.loads(original)
+        stamped["traffic_join"]["generated_at"] = "2026-11-13T07:00:00+00:00"
+        spots.write_text(json.dumps(stamped) + "\n")
+        kept = run(repo)
+        assert kept.returncode == 0, kept.stderr
+        assert "traffic unchanged" in kept.stdout
+        assert spots.read_text() == original
+
+        changed = json.loads(original)
+        changed["traffic_join"]["generated_at"] = "2026-11-13T08:00:00+00:00"
+        changed["fish"][0]["traffic"]["intensity"] = 9.0
+        changed["top_fish_by_traffic"][0]["intensity"] = 9.0
+        spots.write_text(json.dumps(changed) + "\n")
+        updated = run(repo)
+        assert updated.returncode == 0, updated.stderr
+        assert "traffic content changed" in updated.stdout
+        assert json.loads(spots.read_text())["fish"][0]["traffic"]["intensity"] == 9.0
+
+        # A missing HEAD file is new content, not a failed join.
+        subprocess.check_call(["git", "rm", "-q", "--cached", "docs/data/boatboard_spots.json"], cwd=repo)
+        # The path is still in HEAD. Drop it from the tree with a commit.
+        subprocess.check_call(["git", "commit", "-q", "-m", "drop spots"], cwd=repo)
+        spots.write_text(json.dumps(changed) + "\n")
+        fresh = run(repo)
+        assert fresh.returncode == 0, fresh.stderr
+        assert "no previous file" in fresh.stdout
+        assert spots.exists()
+
+
 def main() -> None:
     cadastre = _text(".github/workflows/cadastre-extract.yml")
     fish = _text(".github/workflows/fish-reports.yml")
@@ -200,6 +271,20 @@ def main() -> None:
     assert "detect_stops.py" in ingest
     assert "build_map_data.py" in ingest
     assert "build_courses_data.py" in ingest
+    assert "map_boatboard_traffic.py" in ingest
+    assert "import_boatboard_spots" not in ingest
+    assert "species_groups.json" not in ingest
+    assert "fishmap_annotations.json" not in ingest
+    assert "meta.json" not in ingest
+    assert ingest.index("build_map_data.py") < ingest.index("build_courses_data.py")
+    assert ingest.index("build_courses_data.py") < ingest.index("map_boatboard_traffic.py")
+    assert ingest.index("map_boatboard_traffic.py") < ingest.index('echo "rebuilt=true"')
+    assert "map_boatboard_traffic.py failed" in ingest
+    assert "boatboard spots compare failed" in ingest
+    assert 'git checkout -- "$spots"' in ingest
+    assert "traffic_join" in ingest or "generated_at" in ingest
+    assert "boatboard_spots: traffic unchanged; kept previous file" in ingest
+    assert "boatboard_spots: traffic content changed" in ingest
     assert "<3500" in ingest
     assert 'FISH_REF=main' in ingest
     assert 'git push || git push origin "HEAD:${FISH_REF}"' in ingest
@@ -223,6 +308,7 @@ def main() -> None:
 
     _check_log_filter(ingest)
     _check_gh_wrapper(ingest)
+    _check_spots_churn(ingest)
 
     print("test_workflows: ok")
 
